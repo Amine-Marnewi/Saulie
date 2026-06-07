@@ -51,6 +51,7 @@ from dpo.train.dpo_report import write_report
 from dpo.train.dpo_trainer_compat import (
     AssistantOnlyDPOCollator,
     AssistantOnlyDPOTrainer,
+    BAKED_POLICY_ADAPTER_STACK,
     collect_adapter_diagnostics,
     enforce_adapter_gradients,
 )
@@ -172,6 +173,57 @@ def build_dpo_peft_model(lora_r: int, lora_alpha: int, lora_dropout: float) -> P
     return model
 
 
+def build_dpo_peft_model_baked(lora_r: int, lora_alpha: int, lora_dropout: float) -> PeftModel:
+    """
+    Plan B: BnB8(SFT-merged dense base) + frozen zero default + trainable DPO.
+    TRL copies default -> ref (baked-base reference, no trial-17 LoRA path).
+    """
+    from dpo.train.dpo_trainer_compat import SAULIE_STACK_ATTR
+    from dpo.train.model_load import load_sft_baked_base
+    from dpo.train.paths import MODEL_ID_SFT_MERGED_BF16
+
+    print(f"Loading Plan B stack: BnB SFT-merged base ({MODEL_ID_SFT_MERGED_BF16})")
+    print("  + frozen zero default (ref anchor) + trainable DPO LoRA...")
+    base = load_sft_baked_base("bnb")
+
+    zero_cfg = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=LORA_TARGETS,
+        bias="none",
+        task_type="CAUSAL_LM",
+        init_lora_weights=True,
+    )
+    model = PeftModel(base, zero_cfg, adapter_name=SFT_ADAPTER_NAME)
+    for name, param in model.named_parameters():
+        if f".{SFT_ADAPTER_NAME}." in name and "lora_" in name:
+            param.data.zero_()
+        param.requires_grad = False
+
+    dpo_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=LORA_TARGETS,
+        bias="none",
+        task_type="CAUSAL_LM",
+        init_lora_weights=True,
+    )
+    model.add_adapter(DPO_ADAPTER_NAME, dpo_config)
+    for name, param in model.named_parameters():
+        if f".{DPO_ADAPTER_NAME}." in name:
+            param.requires_grad = True
+
+    setattr(model, SAULIE_STACK_ATTR, "baked")
+    print(f"  peft adapters (pre-trainer): {list(model.peft_config.keys())}")
+    print(f"  policy stack: {BAKED_POLICY_ADAPTER_STACK} (set in trainer)")
+    print("  reference: TRL ref adapter (copy of zero default = baked base)")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  trainable params (dpo): {trainable:,}")
+    return model
+
+
 def save_dpo_adapter(model: PeftModel, output_dir: Path) -> None:
     """Persist only the DPO adapter; never overwrite SFT trial-17 files."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +258,15 @@ def extract_reward_metrics(trainer) -> dict[str, float]:
     return {}
 
 
+def rpo_loss_bundle(
+    primary_loss_types: list[str], rpo_alpha: float | None
+) -> tuple[list[str], list[float] | None]:
+    """Map rpo_alpha to TRL multi-loss (DPO + chosen NLL / SFT auxiliary)."""
+    if rpo_alpha is None or float(rpo_alpha) <= 0:
+        return primary_loss_types, None
+    return primary_loss_types + ["sft"], [1.0, float(rpo_alpha)]
+
+
 def make_dpo_config(
     output_dir: Path,
     *,
@@ -223,43 +284,48 @@ def make_dpo_config(
     use_weighting: bool,
     label_smoothing: float,
     neftune_noise_alpha: float,
+    rpo_alpha: float | None = None,
     live_logging: bool = False,
 ) -> DPOConfig:
-    return DPOConfig(
-        output_dir=str(output_dir),
-        num_train_epochs=num_train_epochs,
-        per_device_train_batch_size=per_device_train_batch_size,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=learning_rate,
-        lr_scheduler_type=lr_scheduler_type,
-        warmup_ratio=warmup_ratio,
-        max_grad_norm=max_grad_norm,
-        weight_decay=weight_decay,
-        beta=beta,
-        loss_type=loss_type,
-        ld_alpha=ld_alpha,
-        use_weighting=use_weighting,
-        label_smoothing=label_smoothing,
-        max_length=MAX_LENGTH,
-        truncation_mode="keep_end",
-        precompute_ref_log_probs=True,
-        precompute_ref_batch_size=2,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        bf16=True,
-        optim="paged_adamw_32bit",
-        neftune_noise_alpha=neftune_noise_alpha,
-        logging_steps=1 if live_logging else 10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=False,
-        save_total_limit=1,
-        seed=SEED,
-        report_to="none",
-        remove_unused_columns=False,
-        disable_tqdm=not live_logging,
-    )
+    loss_types, loss_weights = rpo_loss_bundle(loss_type, rpo_alpha)
+    kwargs: dict = {
+        "output_dir": str(output_dir),
+        "num_train_epochs": num_train_epochs,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "per_device_eval_batch_size": 1,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "learning_rate": learning_rate,
+        "lr_scheduler_type": lr_scheduler_type,
+        "warmup_ratio": warmup_ratio,
+        "max_grad_norm": max_grad_norm,
+        "weight_decay": weight_decay,
+        "beta": beta,
+        "loss_type": loss_types,
+        "ld_alpha": ld_alpha,
+        "use_weighting": use_weighting,
+        "label_smoothing": label_smoothing,
+        "max_length": MAX_LENGTH,
+        "truncation_mode": "keep_end",
+        "precompute_ref_log_probs": True,
+        "precompute_ref_batch_size": 2,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "bf16": True,
+        "optim": "paged_adamw_32bit",
+        "neftune_noise_alpha": neftune_noise_alpha,
+        "logging_steps": 1 if live_logging else 10,
+        "eval_strategy": "epoch",
+        "save_strategy": "epoch",
+        "load_best_model_at_end": False,
+        "save_total_limit": 1,
+        "seed": SEED,
+        "report_to": "none",
+        "remove_unused_columns": False,
+        "disable_tqdm": not live_logging,
+    }
+    if loss_weights is not None:
+        kwargs["loss_weights"] = loss_weights
+    return DPOConfig(**kwargs)
 
 
 def run_training(
@@ -276,6 +342,8 @@ def run_training(
     from dpo.train.dpo_trainer_compat import (
         StepWatchdogCallback,
         TrainingHeartbeatCallback,
+        ensure_policy_forward,
+        is_baked_stack_model,
     )
     from dpo.train.ref_logprob_cache import get_last_ref_cache_meta
 
@@ -305,8 +373,14 @@ def run_training(
         data_collator=collator,
         callbacks=callbacks,
     )
+    from dpo.train.dpo_trainer_compat import require_reference_adapter
+
+    require_reference_adapter(trainer.accelerator.unwrap_model(trainer.model))
     print(f"  peft adapters (post-trainer): {list(trainer.model.peft_config.keys())}")
-    enforce_adapter_gradients(trainer.model)
+    if is_baked_stack_model(trainer.model):
+        ensure_policy_forward(trainer.model)
+    else:
+        enforce_adapter_gradients(trainer.model)
     trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
     print(f"  trainable params after TRL init (dpo only): {trainable:,}")
     adapter_diag = collect_adapter_diagnostics(trainer.model, trainer)
@@ -541,13 +615,16 @@ def derive_trial_params(params: dict) -> dict:
     grad_accum = params["gradient_accumulation_steps"]
     loss_type, ld_alpha, use_weighting = parse_length_mode(params["length_mode"])
     effective_batch = batch_size * grad_accum
-    return {
+    out = {
         "lora_alpha": 2 * lora_r,
         "effective_batch": effective_batch,
         "loss_type": loss_type,
         "ld_alpha": ld_alpha,
         "use_weighting": use_weighting,
     }
+    if "rpo_alpha" in params:
+        out["rpo_alpha"] = params["rpo_alpha"]
+    return out
 
 
 def run_optuna_trial(
@@ -555,6 +632,7 @@ def run_optuna_trial(
     trial: optuna.Trial,
     *,
     solo_record: dict | None = None,
+    fixed_params: dict | None = None,
 ) -> float:
     from dpo.train import optuna_parallel as op
     from dpo.train.dpo_diagnostics import (
@@ -562,9 +640,13 @@ def run_optuna_trial(
         build_trial_scorecard,
         compute_hybrid_score_v1_1,
         compute_val_diagnostics,
+        evaluate_v1_5_trial,
         get_provenance,
+        load_v1_5_control_anchor,
         log_line,
         log_trial_scorecard,
+        style_accuracy_from_val_diag,
+        update_v1_5_control_anchor,
         worker_prefix,
     )
     from dpo.train.mlflow_study import log_trial_from_optuna, parent_run_id, setup_mlflow
@@ -574,7 +656,7 @@ def run_optuna_trial(
         os.environ.setdefault("MLFLOW_EXPERIMENT_NAME", cfg.experiment_name)
         setup_mlflow()
 
-    is_solo = solo_record is not None
+    is_solo = solo_record is not None and fixed_params is None
     is_parallel_worker = cfg.worker_id is not None and not is_solo
     prefix = worker_prefix(cfg.worker_id, solo=is_solo)
     t0 = time.time()
@@ -584,9 +666,10 @@ def run_optuna_trial(
 
     vram_start = op.cuda_mem_snapshot()
     stage = "init"
+    canonical: dict = {}
 
     if is_solo:
-        params = op.expand_params_for_training(dict(solo_record["params"]))
+        canonical = op.resolve_canonical_trial_params(trial, cfg, solo_record=solo_record)
         trial.set_user_attr("solo_retry", True)
         trial.set_user_attr("requires_solo", True)
         orig = solo_record.get("original_trial_numbers") or [
@@ -597,11 +680,60 @@ def run_optuna_trial(
             [n for n in orig if n is not None],
         )
     else:
-        params = op.sample_trial_params(trial, cfg)
-        op.check_duplicate_params(trial)
-        op.set_sampler_trial_metadata(trial, cfg)
-        if op.params_key(dict(trial.params)) == op.params_key(op.ANCHOR_TRIAL_PARAMS_V11):
-            trial.set_user_attr("anchor_trial", True)
+        canonical = op.resolve_canonical_trial_params(
+            trial, cfg, fixed_params=fixed_params
+        )
+        if cfg.study_version == "v1.2":
+            trial.set_user_attr("enqueued_trial", True)
+            trial.set_user_attr("rescue_label", op.rescue_label_for_params(canonical))
+            trial.set_user_attr(
+                "plan_a_trial_index", 2 if canonical.get("length_mode") == "ipo" else 1
+            )
+            op.set_sampler_trial_metadata(trial, cfg)
+        elif cfg.study_version in op.PLAN_B_STUDY_VERSIONS:
+            trial.set_user_attr("enqueued_trial", True)
+            label = op.plan_b_label_for_params(canonical)
+            if label == "plan_b_unknown" and 0 <= trial.number < len(op.PLAN_B_LABELS):
+                label = op.PLAN_B_LABELS[trial.number]
+            trial.set_user_attr("plan_b_label", label)
+            if cfg.study_version == "v1.3":
+                trial.set_user_attr("stack_mode", "baked_sft_merged")
+                trial.set_user_attr("base_kind", "sft_merged_bnb8")
+            else:
+                trial.set_user_attr("stack_mode", "unmerged_sft_lora")
+                trial.set_user_attr("base_kind", "bnb8_sft_lora")
+            op.set_sampler_trial_metadata(trial, cfg)
+        elif cfg.study_version == op.V1_5_STUDY_VERSION:
+            fid = op.v1_5_fixed_id_for_params(canonical)
+            trial.set_user_attr("fixed_or_sampled", "fixed" if fid else "sampled")
+            if fid:
+                trial.set_user_attr("fixed_id", fid)
+                trial.set_user_attr("enqueued_trial", True)
+                trial.set_user_attr("v1_5_label", op.v1_5_label_for_params(canonical))
+            else:
+                trial.set_user_attr("v1_5_label", "v1_5_sampled")
+            trial.set_user_attr("stack_mode", "unmerged_sft_lora")
+            trial.set_user_attr("base_kind", "bnb8_sft_lora")
+            op.set_sampler_trial_metadata(trial, cfg)
+        elif not fixed_params:
+            op.check_duplicate_params(trial)
+            op.set_sampler_trial_metadata(trial, cfg)
+            if op.params_key(dict(trial.params)) == op.params_key(op.ANCHOR_TRIAL_PARAMS_V11):
+                trial.set_user_attr("anchor_trial", True)
+        else:
+            op.set_sampler_trial_metadata(trial, cfg)
+
+    if cfg.study_version in ("v1.2", *op.PLAN_B_STUDY_VERSIONS) or fixed_params is not None or is_solo:
+        if not canonical:
+            raise optuna.TrialPruned("missing_trial_params")
+        params = op.expand_params_for_training(canonical)
+    elif cfg.study_version == op.V1_5_STUDY_VERSION:
+        params = op.resolve_trial_params(trial, cfg)
+        canonical = op.to_canonical_params(params)
+    else:
+        params = op.resolve_trial_params(trial, cfg)
+        canonical = op.to_canonical_params(params)
+    op.persist_trial_params(trial, canonical)
 
     derived = derive_trial_params(params)
     datasets, tokenizer = _ensure_optuna_data(cfg.dummy_report_path)
@@ -615,7 +747,7 @@ def run_optuna_trial(
         log_trial_from_optuna(
             trial,
             state=state,
-            params=params,
+            params=canonical if canonical else params,
             derived=derived,
             scorecard=scorecard,
             run_dir=cfg.run_dir,
@@ -641,7 +773,12 @@ def run_optuna_trial(
         log_line(prefix, f"stage={stage}")
 
     try:
-        if cfg.study_version != "v1.1" and (
+        if cfg.study_version not in (
+            "v1.1",
+            "v1.2",
+            *op.PLAN_B_STUDY_VERSIONS,
+            op.V1_5_STUDY_VERSION,
+        ) and (
             derived["effective_batch"] < 4 or derived["effective_batch"] > 16
         ):
             trial.set_user_attr(
@@ -660,6 +797,8 @@ def run_optuna_trial(
         log_line(prefix, f"  beta={params['beta']} epochs={params['num_train_epochs']} lr={params['learning_rate']:.2e}")
         log_line(prefix, f"  lora_r={params['lora_r']} batch={params['per_device_train_batch_size']} accum={params['gradient_accumulation_steps']} eff={derived['effective_batch']}")
         log_line(prefix, f"  length_mode={params['length_mode']} neftune={params['neftune_noise_alpha']} sched={params['lr_scheduler_type']}")
+        if "rpo_alpha" in params:
+            log_line(prefix, f"  rpo_alpha={params['rpo_alpha']}")
         log_line(prefix, f"  trial_dir={trial_dir}")
 
         from dpo.train.dpo_trainer_compat import TrialWallTimeout
@@ -680,9 +819,14 @@ def run_optuna_trial(
 
                 reset_ref_cache_meta()
                 _set_stage("model_build")
-                model = build_dpo_peft_model(
-                    params["lora_r"], derived["lora_alpha"], params["lora_dropout"]
-                )
+                if cfg.study_version == "v1.3":
+                    model = build_dpo_peft_model_baked(
+                        params["lora_r"], derived["lora_alpha"], params["lora_dropout"]
+                    )
+                else:
+                    model = build_dpo_peft_model(
+                        params["lora_r"], derived["lora_alpha"], params["lora_dropout"]
+                    )
                 dpo_args = make_dpo_config(
                     trial_dir,
                     num_train_epochs=params["num_train_epochs"],
@@ -699,6 +843,7 @@ def run_optuna_trial(
                     use_weighting=derived["use_weighting"],
                     label_smoothing=0.0,
                     neftune_noise_alpha=params["neftune_noise_alpha"],
+                    rpo_alpha=params.get("rpo_alpha", 0.0),
                     live_logging=True,
                 )
                 _set_stage("precompute_ref_and_train")
@@ -763,6 +908,15 @@ def run_optuna_trial(
                 trial.set_user_attr("vram", vram)
                 trial.set_user_attr("adapter_diagnostics", adapter_diag)
                 trial.set_user_attr("derived", derived)
+                trial.set_user_attr("mask_audit_pass", get_provenance().get("mask_audit_pass"))
+                if adapter_diag.get("available_adapters") is not None:
+                    trial.set_user_attr("available_adapters", adapter_diag["available_adapters"])
+                if adapter_diag.get("active_adapters") is not None:
+                    trial.set_user_attr("active_adapters", adapter_diag["active_adapters"])
+                if val_diag:
+                    style_acc = style_accuracy_from_val_diag(val_diag)
+                    if style_acc is not None:
+                        trial.set_user_attr("style_accuracy", style_acc)
 
                 if is_solo:
                     trial.set_user_attr("parallel_oom_recovered", True)
@@ -773,28 +927,81 @@ def run_optuna_trial(
                 acc_f = float(acc)
                 trial.set_user_attr("eval_rewards_accuracy", acc_f)
                 objective = acc_f
-                if cfg.study_version == "v1.1":
-                    hybrid = compute_hybrid_score_v1_1(
-                        accuracy=acc_f,
-                        macro_family_category=val_diag.get(
-                            "macro_accuracy_by_source_family_category"
-                        )
-                        if val_diag
-                        else None,
-                        margin=scorecard.get("eval_rewards_margin"),
-                        eval_loss=scorecard.get("eval_loss"),
-                        len_corr=val_diag.get("margin_vs_length_delta_corr")
-                        if val_diag
-                        else None,
-                        abs_len_corr=val_diag.get("margin_vs_abs_length_delta_corr")
-                        if val_diag
-                        else None,
+                margin = scorecard.get("eval_rewards_margin")
+                if margin is not None:
+                    trial.set_user_attr("eval_rewards_margin", float(margin))
+                    if cfg.study_version in ("v1.2", *op.PLAN_B_STUDY_VERSIONS) and float(margin) > 5.0:
+                        trial.set_user_attr("high_margin_warning", True)
+                    if cfg.study_version in op.PLAN_B_STUDY_VERSIONS and float(margin) < -3.0:
+                        trial.set_user_attr("low_margin_note", True)
+                hybrid = compute_hybrid_score_v1_1(
+                    accuracy=acc_f,
+                    macro_family_category=val_diag.get(
+                        "macro_accuracy_by_source_family_category"
                     )
-                    trial.set_user_attr("hybrid_score_v1_1", hybrid)
+                    if val_diag
+                    else None,
+                    margin=margin,
+                    eval_loss=scorecard.get("eval_loss"),
+                    len_corr=val_diag.get("margin_vs_length_delta_corr")
+                    if val_diag
+                    else None,
+                    abs_len_corr=val_diag.get("margin_vs_abs_length_delta_corr")
+                    if val_diag
+                    else None,
+                )
+                trial.set_user_attr("hybrid_score_v1_1", hybrid)
+                if cfg.study_version == "v1.1":
                     objective = hybrid
+                elif cfg.study_version == op.V1_5_STUDY_VERSION:
+                    anchor_state = load_v1_5_control_anchor(cfg.run_dir)
+                    rpo_a = float(params.get("rpo_alpha", 0.0))
+                    fid = op.v1_5_fixed_id_for_params(canonical)
+                    if rpo_a <= 0 and scorecard.get("eval_logps_chosen") is not None:
+                        update_v1_5_control_anchor(
+                            cfg.run_dir,
+                            fixed_id=fid,
+                            eval_logps_chosen=float(scorecard["eval_logps_chosen"]),
+                        )
+                        anchor_state = load_v1_5_control_anchor(cfg.run_dir)
+                    objective, v15_detail = evaluate_v1_5_trial(
+                        scorecard=scorecard,
+                        val_diag=val_diag,
+                        provenance=get_provenance(),
+                        adapter_diag=adapter_diag,
+                        params=params,
+                        control_anchor=anchor_state.get("anchor"),
+                        both_controls_complete=bool(
+                            anchor_state.get("both_controls_complete")
+                        ),
+                    )
+                    for k, v in v15_detail.items():
+                        trial.set_user_attr(k, v)
+                    trial.set_user_attr(
+                        "control_eval_logps_chosen", anchor_state.get("anchor")
+                    )
+                    log_line(
+                        prefix,
+                        f"  v1_5_survival_score={objective:.4f} "
+                        f"gates_pass={v15_detail.get('hard_gate_pass')} "
+                        f"penalties={v15_detail.get('penalties', 0):.2f}",
+                    )
                 log_trial_scorecard(prefix, trial.number, scorecard, val_diag)
                 if cfg.study_version == "v1.1":
                     log_line(prefix, f"  hybrid_score_v1_1={objective:.4f}")
+                elif cfg.study_version == op.V1_5_STUDY_VERSION:
+                    pass
+                elif cfg.study_version in ("v1.2", *op.PLAN_B_STUDY_VERSIONS):
+                    tag = {
+                        "v1.2": "v1.2",
+                        "v1.3": "v1.3-sft-merged",
+                        "v1.4": "v1.4-unmerged",
+                    }.get(cfg.study_version, cfg.study_version)
+                    log_line(
+                        prefix,
+                        f"  {tag} telemetry=accuracy={acc_f:.4f} hybrid_ref={hybrid:.4f} "
+                        f"margin={margin} (REPL picks winner)",
+                    )
                 objective_result = objective
                 _set_stage("complete")
             except TrialWallTimeout as e:
@@ -868,10 +1075,31 @@ def run_optuna(args):
     elif args.optuna_smoke:
         print(" DPO OPTUNA SMOKE TEST (2 workers, 2 complete trials)")
     elif args.parallel_workers > 0:
-        print(
-            f" DPO PARALLEL OPTUNA ({args.parallel_workers} workers, "
-            f"target={args.target_complete_trials} complete)"
-        )
+        if getattr(args, "study_version", "v1.1") == "v1.2":
+            print(
+                f" DPO PLAN A v1.2 RESCUE ({args.parallel_workers} worker(s), "
+                f"target={args.target_complete_trials} fixed trials)"
+            )
+        elif getattr(args, "study_version", "v1.1") == "v1.3":
+            print(
+                f" DPO PLAN B v1.3 SFT-MERGED ({args.parallel_workers} worker(s), "
+                f"target={args.target_complete_trials} fixed trials)"
+            )
+        elif getattr(args, "study_version", "v1.1") == "v1.4":
+            print(
+                f" DPO PLAN B v1.4 UNMERGED ({args.parallel_workers} worker(s), "
+                f"target={args.target_complete_trials} fixed trials)"
+            )
+        elif getattr(args, "study_version", "v1.1") == "v1.5":
+            print(
+                f" DPO v1.5 HYBRID ({args.parallel_workers} worker(s), "
+                f"target={args.target_complete_trials} trials, survival objective)"
+            )
+        else:
+            print(
+                f" DPO PARALLEL OPTUNA ({args.parallel_workers} workers, "
+                f"target={args.target_complete_trials} complete)"
+            )
     else:
         print(f" DPO OPTUNA STUDY ({args.n_trials} trials, single process)")
     print("=" * 60)
@@ -958,7 +1186,11 @@ def run_optuna(args):
     with mlflow.start_run(run_name=f"optuna-{datetime.now().strftime('%Y%m%d-%H%M%S')}"):
         study.optimize(objective, n_trials=args.n_trials)
         best = study.best_trial
-        summary_path = OUTPUT_BASE / EXPERIMENT_NAME / "trial_summary.json"
+        from dpo.train.paths import trial_summary_path
+
+        summary_path = trial_summary_path(
+            OUTPUT_BASE / EXPERIMENT_NAME, getattr(args, "study_version", "v1.0")
+        )
         summary_path.write_text(
             json.dumps(
                 {
